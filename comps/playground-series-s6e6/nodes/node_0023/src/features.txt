@@ -1,0 +1,15 @@
+alpha
+delta
+u
+g
+r
+i
+z
+redshift
+spectral_type
+galaxy_population
+u_g
+g_r
+r_i
+i_z
+u_z

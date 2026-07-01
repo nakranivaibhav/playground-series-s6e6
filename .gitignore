@@ -1,0 +1,43 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Commit the RECIPE (code + markdown), never the OUTPUT (data, models, blobs).
+# Everything ignored here is regenerable by re-running the code — see README.
+# NOTE: Kaggle competition data must not be redistributed; data/ stays ignored.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# competition data (re-download via tools/kaggle_io.py) — and never redistribute
+comps/*/data/
+# pulled external kernels + OOF banks (re-pullable)
+comps/*/refs/
+
+# regenerable per-node artifacts
+*.npy            # oof.npy, test_probs.npy
+*.csv            # submission.csv, sample_submission.csv, OOF CSVs
+*.log            # train.log
+*.pkl            # AutoGluon / sklearn model dumps
+*.pt             # torch checkpoints
+*.ckpt
+*.parquet
+*.bin
+comps/*/**/catboost_info/
+comps/*/**/ag_fold_*/
+
+# frozen fold indices — 8.8 MB; regenerate from the seed in validation.md
+comps/*/folds.json
+
+# machine-local Claude Code settings + the cross-competition case bank
+.claude/settings.json
+.claude/settings.local.json
+MEMORY.md
+
+# python caches / build artifacts
+__pycache__/
+*.pyc
+*.egg-info/
+.ipynb_checkpoints/
+
+# secrets (defense-in-depth) — but the template ships
+.env
+.env.*
+kaggle.json
+.kaggle/
+!.env.example

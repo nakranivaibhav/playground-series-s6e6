@@ -1,0 +1,32 @@
+[
+  {
+    "name": "target_not_in_features",
+    "passed": true,
+    "severity": "error",
+    "detail": "ok"
+  },
+  {
+    "name": "id_not_in_features",
+    "passed": true,
+    "severity": "error",
+    "detail": "ok"
+  },
+  {
+    "name": "feature_target_correlation",
+    "passed": true,
+    "severity": "warn",
+    "detail": "target absent; skipped"
+  },
+  {
+    "name": "train_test_duplicates",
+    "passed": true,
+    "severity": "warn",
+    "detail": "ok"
+  },
+  {
+    "name": "no_global_fit_in_source",
+    "passed": true,
+    "severity": "warn",
+    "detail": "ok"
+  }
+]

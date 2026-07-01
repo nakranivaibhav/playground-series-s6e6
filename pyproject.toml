@@ -1,0 +1,56 @@
+[project]
+name = "kaggleforge"
+version = "0.1.0"
+description = "Human-in-the-loop, markdown-driven Kaggle solver that runs inside Claude Code"
+readme = "README.md"
+requires-python = ">=3.10"
+# Deps here are ONLY for the thin reusable scripts in tools/. The orchestration
+# is markdown (skills + subagents + CLAUDE.md), not python. Competition-specific
+# modelling deps (lightgbm, darts, timm, ...) are added per-competition with
+# `uv add` when a node needs them — never pinned globally.
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "scikit-learn>=1.3",
+    "kaggle>=1.7.4.5",
+    "lightgbm>=4.6.0",
+    "catboost>=1.2.10",
+    "xgboost>=3.2.0",
+    "torch>=2.11.0",
+    "tabm>=0.0.3",
+    "rtdl-num-embeddings>=0.0.12",
+    "rtdl-revisiting-models>=0.0.2",
+    "pytabkit[models]>=1.7.3",
+    "tabpfn>=2.5",
+    "tabicl>=2.1.1",
+    "optuna",
+    "torchvision>=0.26.0",
+    "ultralytics",
+    "autogluon-tabular>=1.5.0",
+    "pytorch-tabular>=1.2.0",
+    "torch-geometric>=2.8.0",
+    "sdv>=1.32.1",
+    "pysdr>=1.2",
+    "umap-learn>=0.5.12",
+    "speclite>=1.0.0",
+    "loguru>=0.7.3",
+    "einx>=0.4.3",
+    "omegaconf>=2.3.1",
+    "transformers>=5.12.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.uv]
+# torch's CUDA index only serves an old torchmetrics (1.0.3); pytabkit[models]
+# needs >=1.2.1 from PyPI. Allow uv to pick the best version across both indexes.
+index-strategy = "unsafe-best-match"
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu128"
+
+# The Kaggle CLI is a runtime tool invoked via subprocess by tools/kaggle_io.py.
+# Install it into this project's env once: `uv add kaggle`.

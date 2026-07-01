@@ -1,0 +1,13 @@
+{
+  "id": "vaibhavnakrani/s6e6-realmlp-single-private",
+  "title": "S6E6 RealMLP Single Private",
+  "code_file": "s6e6-realmlp-single-private.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "dataset_sources": [],
+  "competition_sources": ["playground-series-s6e6"],
+  "kernel_sources": []
+}

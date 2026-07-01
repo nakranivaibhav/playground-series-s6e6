@@ -1,0 +1,662 @@
+"""node_0111 — STAR-recall-weighted TabM base.
+
+THE ONE ATOMIC CHANGE vs node_0033:
+  Asymmetric per-class sample weights: balanced weights computed as in n033/n016,
+  then the STAR class weight is multiplied by STAR_MULT ∈ {1.5, 2.0}.
+  QSO/GALAXY stay at balanced. Fold-0 sweep to pick best STAR_MULT, then full 5-fold run.
+
+FE pipeline (byte-identical to node_0033):
+  - Stateless FE: redshift ratios, 7 color pairs, mag_mean, mag_range, log1p_redshift,
+    integer-floor categorical views of every base numeric — computed once on full df (safe).
+  - fit_in_fold KBinsDiscretizer (delta 100/500 quantile bins) on train fold only.
+  - fit_in_fold TargetEncoder (on combo cats) on train fold only.
+  - fit_in_fold standardization (mean/std from train fold numerical features only).
+  - fit_in_fold PiecewiseLinearEmbeddings bins (compute_bins on train fold's Xnum+y).
+
+TabM model (byte-identical to node_0033 except weights):
+  - tabm.TabM.make(k=32, n_num_features=..., cat_cardinalities=..., d_out=3, ...)
+    with PiecewiseLinearEmbeddings (PLR, d_embedding=16, n_bins=48, version='B').
+  - Categorical features passed as integer-coded arrays (TabM internally one-hot encodes).
+  - Training: AdamW lr=2e-3, weight_decay=1e-4, CrossEntropyLoss with ASYMMETRIC class weights.
+  - Early stopping: internal 10% val split from train fold (not the OOF fold).
+
+Gates (per plan):
+  - fold-0 BA >= 0.965 (else stop)
+  - fold-0 err-corr vs node_0070/oof.npy < 0.70 (else stop)
+  - If both pass: run all 5 folds at best multiplier.
+
+Leakage discipline:
+  - Weights computed from train-fold y_tr only (inside fold loop). No val/test weighting.
+  - Stateless FE: no target, no cross-row stats, no fitting — safe to compute once.
+  - KBinsDiscretizer, factorize maps, TargetEncoder: fit on train-fold rows only.
+  - Standardization (mean/std): fit on train-fold numerical features only.
+  - compute_bins (PLR): fit on train-fold Xnum + y only.
+  - frozen folds.json used throughout; no refitting of folds.
+
+Outputs: oof.npy (577347,3), test_probs.npy (247435,3), submission.csv, features.txt.
+"""
+from __future__ import annotations
+
+import gc
+import json
+import os
+import random
+import sys
+import time
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from sklearn.metrics import balanced_accuracy_score
+from sklearn.preprocessing import KBinsDiscretizer, TargetEncoder
+from sklearn.utils.class_weight import compute_class_weight
+
+import tabm
+from rtdl_num_embeddings import PiecewiseLinearEmbeddings, compute_bins
+
+warnings.filterwarnings("ignore")
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+NODE_SRC = Path(__file__).resolve().parent
+NODE_DIR = NODE_SRC.parent
+COMP_DIR = NODE_DIR.parent.parent
+
+T0 = time.perf_counter()
+
+
+def log(msg: str):
+    print(f"[{time.perf_counter() - T0:8.1f}s] {msg}", flush=True)
+
+
+# ─── Constants ───────────────────────────────────────────────────────────────
+TARGET = "class"
+IDC = "id"
+DIRECTION = "maximize"
+SEED = 42
+N_CLASSES = 3
+CLASSES = ["GALAXY", "QSO", "STAR"]
+LABEL_MAP = {c: i for i, c in enumerate(CLASSES)}
+INV_MAP = {v: k for k, v in LABEL_MAP.items()}
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+log(f"Device: {DEVICE}  tabm={tabm.__version__}")
+
+SMOKE = os.environ.get("TABM_SMOKE") == "1"
+
+# STAR multiplier sweep — set via env or default None (means sweep fold-0 then pick best)
+# STAR class index in CLASSES = ["GALAXY", "QSO", "STAR"] → index 2
+STAR_IDX = 2
+STAR_MULT_CANDIDATES = [1.5, 2.0]
+# If STAR_MULT env var is set, use it directly (for full 5-fold run after fold-0 sweep)
+_STAR_MULT_ENV = os.environ.get("STAR_MULT")
+STAR_MULT_FIXED: float | None = float(_STAR_MULT_ENV) if _STAR_MULT_ENV else None
+
+# TabM hyperparameters
+D_EMB = 16          # PLR embedding dimension
+N_BINS = 48         # PLR bins (fit per fold on train fold)
+K_ENS = 32          # TabM internal ensemble size
+# n_blocks=2 is the default when num_embeddings is provided (per tabm.TabM.make)
+# d_block=512 is the default; we keep it but use small inference batches
+DROPOUT = 0.1
+MAX_EPOCHS = 100 if not SMOKE else 6
+PATIENCE = 16       # epochs without improvement before stopping
+BATCH_SIZE = 8192
+INFER_BATCH_SIZE = 4096   # small to stay under VRAM during inference
+
+
+def seed_everything(seed: int = 42):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = True   # speed on RTX 5090
+        torch.backends.cudnn.deterministic = False
+
+
+seed_everything(SEED)
+
+# ─── Feature engineering globals (byte-identical to node_0028) ───────────────
+BASE_CAT_COLS = ["spectral_type", "galaxy_population"]
+BASE_NUM_COLS = ["alpha", "delta", "u", "g", "r", "i", "z", "redshift"]
+
+COLOR_PAIRS = [
+    ("u", "g"), ("g", "r"), ("r", "i"), ("i", "z"),
+    ("u", "r"), ("g", "i"), ("r", "z"),
+]
+
+IMPORTANT_COMBOS = sorted([
+    ("alpha_cat_", "delta_cat_"),
+    ("u_cat_", "z_cat_"),
+])
+
+
+def stateless_fe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Pure row-wise / stateless feature engineering — safe to apply to the full
+    dataframe before any fold split. No fitting, no target, no cross-row stats.
+    """
+    df = df.copy()
+
+    # Redshift ratios
+    df["_g_div_redshift"] = (df["g"] / (df["redshift"] + 1e-6)).replace(
+        [np.inf, -np.inf], np.nan
+    ).fillna(0).astype("float32")
+    df["_i_div_redshift"] = (df["i"] / (df["redshift"] + 1e-6)).replace(
+        [np.inf, -np.inf], np.nan
+    ).fillna(0).astype("float32")
+
+    # Color pairs
+    for a, b in COLOR_PAIRS:
+        df[f"_{a}-{b}"] = (df[a] - df[b]).astype("float32")
+
+    # Magnitude aggregates
+    mags = df[["u", "g", "r", "i", "z"]].astype("float32")
+    df["_mag_mean"] = mags.mean(axis=1).astype("float32")
+    df["_mag_range"] = (mags.max(axis=1) - mags.min(axis=1)).astype("float32")
+
+    # Log1p of shifted redshift
+    shifted_rs = df["redshift"].astype("float32") - min(0.0, float(df["redshift"].min())) + 1e-4
+    df["_log1p_redshift"] = np.log1p(shifted_rs).astype("float32")
+
+    return df
+
+
+def fit_fold_categoricals(df_tr: pd.DataFrame, df_val: pd.DataFrame, df_te: pd.DataFrame):
+    """
+    Fit categorical encodings on train-fold only, transform val and test.
+    Returns (df_tr, df_val, df_te, cat_cols, combo_names, local_map).
+    Called INSIDE the fold loop — fit_in_fold.
+    """
+    local_map: dict = {}
+
+    def factorize_fit(series):
+        codes, uniques = pd.factorize(series, sort=False)
+        return codes.astype("int32"), uniques
+
+    def factorize_transform(series, uniques):
+        code_map = {cat: i for i, cat in enumerate(uniques)}
+        return series.map(code_map).fillna(-1).astype("int32")
+
+    tr = df_tr.copy()
+    va = df_val.copy()
+    te = df_te.copy()
+
+    # Original categorical columns (spectral_type, galaxy_population)
+    for col in BASE_CAT_COLS:
+        codes_tr, uniques = factorize_fit(tr[col])
+        local_map[col] = uniques
+        tr[col] = pd.Series(codes_tr, index=tr.index).astype("int32").astype("category")
+        va[col] = pd.Series(factorize_transform(va[col], uniques), index=va.index).astype("int32").astype("category")
+        te[col] = pd.Series(factorize_transform(te[col], uniques), index=te.index).astype("int32").astype("category")
+
+    # Integer-floor categorical views of every base numeric
+    for col in BASE_NUM_COLS:
+        cat_name = f"{col}_cat_"
+        floored_tr = np.floor(tr[col]).astype("float32")
+        codes_tr, uniques = factorize_fit(floored_tr)
+        local_map[cat_name] = uniques
+        tr[cat_name] = pd.Series(codes_tr, index=tr.index).astype("int32").astype("category")
+        for dset, dset_tr in [(va, df_val), (te, df_te)]:
+            floored = np.floor(dset[col]).astype("float32")
+            codes = factorize_transform(floored, uniques)
+            dset[cat_name] = pd.Series(codes, index=dset.index).astype("int32").astype("category")
+
+    # Delta quantile bins (100 and 500) — fit_in_fold via KBinsDiscretizer
+    for n_bins in [100, 500]:
+        bin_name = f"delta_{n_bins}_quantile_bin_"
+        kb = KBinsDiscretizer(n_bins=n_bins, encode="ordinal", strategy="quantile", subsample=None)
+        binned_tr = kb.fit_transform(tr[["delta"]]).ravel().astype("int32")
+        local_map[bin_name] = kb
+        tr[bin_name] = pd.Series(binned_tr, index=tr.index).astype("int32").astype("category")
+        for dset in [va, te]:
+            binned = kb.transform(dset[["delta"]]).ravel().astype("int32")
+            dset[bin_name] = pd.Series(binned, index=dset.index).astype("int32").astype("category")
+
+    # Interaction cross-combos
+    combo_names = []
+    for cols in IMPORTANT_COMBOS:
+        combo_name = "__".join(cols) + "__"
+        combo_names.append(combo_name)
+        combo_tr = tr[cols[0]].astype(str)
+        for col in cols[1:]:
+            combo_tr = combo_tr + "|" + tr[col].astype(str)
+        codes_tr, uniques = pd.factorize(combo_tr, sort=False)
+        local_map[combo_name] = uniques
+        tr[combo_name] = pd.Series(codes_tr.astype("int32"), index=tr.index).astype("int32").astype("category")
+        for dset in [va, te]:
+            combo_s = dset[cols[0]].astype(str)
+            for col in cols[1:]:
+                combo_s = combo_s + "|" + dset[col].astype(str)
+            codes = factorize_transform(combo_s, uniques)
+            dset[combo_name] = pd.Series(codes, index=dset.index).astype("int32").astype("category")
+
+    new_cat_cols = sorted([c for c in tr.columns if str(tr[c].dtype) == "category"])
+    return tr, va, te, new_cat_cols, combo_names, local_map
+
+
+def add_target_encoding(X_tr, y_tr, X_val, X_te, combo_names: list, fold_seed: int):
+    """
+    TargetEncoder fit on train fold only (fit_in_fold), transform val and test.
+    Returns modified copies and the list of new TE column names.
+    """
+    X_tr = X_tr.copy()
+    X_val = X_val.copy()
+    X_te = X_te.copy()
+
+    try:
+        encoder = TargetEncoder(
+            target_type="multiclass", cv=5, smooth="auto", shuffle=True, random_state=fold_seed
+        )
+    except TypeError:
+        encoder = TargetEncoder(cv=5, smooth="auto", shuffle=True, random_state=fold_seed)
+
+    tr_enc = encoder.fit_transform(X_tr[combo_names], y_tr)
+    val_enc = encoder.transform(X_val[combo_names])
+    tst_enc = encoder.transform(X_te[combo_names])
+
+    te_names = [f"_{col}TE_class{cls}" for col in combo_names for cls in range(N_CLASSES)]
+    X_tr[te_names] = np.asarray(tr_enc, dtype="float32")
+    X_val[te_names] = np.asarray(val_enc, dtype="float32")
+    X_te[te_names] = np.asarray(tst_enc, dtype="float32")
+
+    return X_tr, X_val, X_te, te_names
+
+
+# ─── TabM training ────────────────────────────────────────────────────────────
+
+def build_tabm_model(n_num: int, cat_cards: list[int], bins: list) -> tabm.TabM:
+    """Build a TabM model with PLR embeddings.
+    Uses tabm.TabM.make defaults (n_blocks=2 with num_embeddings, d_block=512, k=32).
+    """
+    num_emb = PiecewiseLinearEmbeddings(bins, d_embedding=D_EMB, activation=False, version="B")
+    model = tabm.TabM.make(
+        n_num_features=n_num,
+        cat_cardinalities=cat_cards if cat_cards else None,
+        d_out=N_CLASSES,
+        num_embeddings=num_emb,
+        k=K_ENS,
+        dropout=DROPOUT,
+        # n_blocks and d_block use TabM.make defaults (2 and 512 with PLR)
+    )
+    return model.to(DEVICE)
+
+
+def predict_proba_batch(model: tabm.TabM, Xn: np.ndarray, Xc: np.ndarray | None,
+                        batch_size: int = INFER_BATCH_SIZE) -> np.ndarray:
+    """Run inference in batches, returns (N, 3) probabilities.
+    Uses small batches to stay under VRAM with k=32 ensemble (d_block=512).
+    """
+    model.eval()
+    out = []
+    with torch.no_grad():
+        for s in range(0, len(Xn), batch_size):
+            xn = torch.as_tensor(Xn[s:s + batch_size], dtype=torch.float32, device=DEVICE)
+            xc = (torch.as_tensor(Xc[s:s + batch_size], dtype=torch.long, device=DEVICE)
+                  if Xc is not None else None)
+            logits = model(xn, xc)          # (B, k, 3)
+            probs = torch.softmax(logits.float(), dim=-1).mean(dim=1)  # (B, 3)
+            out.append(probs.cpu().numpy().astype(np.float32))
+    return np.concatenate(out, 0)
+
+
+def train_tabm(
+    Xn_tr: np.ndarray,
+    Xc_tr: np.ndarray | None,
+    y_tr: np.ndarray,
+    cat_cards: list[int],
+    fold_seed: int,
+    star_mult: float = 1.0,
+) -> tuple[tabm.TabM, np.ndarray]:
+    """
+    Train TabM with PLR embeddings. PLR bins computed on train data only (fit_in_fold).
+    Uses internal 10% early-stop split from train fold (not the OOF val fold).
+    Returns (best_model, bins).
+    """
+    torch.manual_seed(fold_seed)
+    np.random.seed(fold_seed)
+
+    # Internal 10% early-stop split
+    n = len(Xn_tr)
+    rng = np.random.default_rng(fold_seed)
+    perm = rng.permutation(n)
+    n_val = max(1, int(0.1 * n))
+    vi, ti = perm[:n_val], perm[n_val:]
+
+    # PLR bins — fit on TRAIN portion only (fit-in-fold, target-aware)
+    bins = compute_bins(
+        torch.as_tensor(Xn_tr[ti], dtype=torch.float32),
+        n_bins=N_BINS,
+        y=torch.as_tensor(y_tr[ti], dtype=torch.long),
+        regression=False,
+        tree_kwargs={"min_samples_leaf": 64},
+    )
+
+    model = build_tabm_model(Xn_tr.shape[1], cat_cards, bins)
+
+    # Class weights — balanced, then STAR (index 2) scaled by star_mult
+    counts = np.bincount(y_tr, minlength=N_CLASSES).astype(np.float64)
+    w = counts.sum() / (N_CLASSES * counts)   # balanced weights
+    w[STAR_IDX] *= star_mult                   # asymmetric STAR boost
+    class_w = torch.tensor(w, dtype=torch.float32, device=DEVICE)
+    loss_fn = nn.CrossEntropyLoss(weight=class_w)
+
+    opt = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=MAX_EPOCHS, eta_min=1e-5)
+
+    # Move train data to GPU
+    Xn_t = torch.as_tensor(Xn_tr[ti], dtype=torch.float32, device=DEVICE)
+    Xc_t = (torch.as_tensor(Xc_tr[ti], dtype=torch.long, device=DEVICE)
+             if Xc_tr is not None else None)
+    y_t = torch.as_tensor(y_tr[ti], dtype=torch.long, device=DEVICE)
+    nt = len(ti)
+
+    yv = y_tr[vi]
+    Xn_vi = Xn_tr[vi]
+    Xc_vi = Xc_tr[vi] if Xc_tr is not None else None
+
+    best_ba = -1.0
+    best_state = None
+    bad = 0
+
+    for ep in range(MAX_EPOCHS):
+        model.train()
+        bperm = torch.randperm(nt, device=DEVICE)
+        for s in range(0, nt, BATCH_SIZE):
+            idx = bperm[s:s + BATCH_SIZE]
+            xn_b = Xn_t[idx]
+            xc_b = Xc_t[idx] if Xc_t is not None else None
+            y_b = y_t[idx]
+            opt.zero_grad()
+            logits = model(xn_b, xc_b)     # (B, k, 3)
+            b, k, c = logits.shape
+            loss = loss_fn(logits.reshape(b * k, c), y_b.repeat_interleave(k))
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+        scheduler.step()
+
+        # Early-stop on internal val
+        val_probs = predict_proba_batch(model, Xn_vi, Xc_vi)
+        ba = balanced_accuracy_score(yv, val_probs.argmax(1))
+        if ba > best_ba + 1e-5:
+            best_ba = ba
+            best_state = {kk: v.detach().clone() for kk, v in model.state_dict().items()}
+            bad = 0
+        else:
+            bad += 1
+            if bad >= PATIENCE:
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    log(f"    TabM early-stop: best_int_ba={best_ba:.5f}  ep_stopped={ep+1}")
+    return model, bins
+
+
+# ─── Load data ────────────────────────────────────────────────────────────────
+log("Loading data ...")
+train_raw = pd.read_csv(COMP_DIR / "data/train.csv")
+test_raw = pd.read_csv(COMP_DIR / "data/test.csv")
+sample_sub = pd.read_csv(COMP_DIR / "data/sample_submission.csv")
+folds_list = json.loads((COMP_DIR / "folds.json").read_text())["folds"]
+log(f"  train={train_raw.shape}  test={test_raw.shape}  folds={len(folds_list)}")
+
+y_all = train_raw[TARGET].map(LABEL_MAP).astype(int).values
+n_train = len(train_raw)
+n_test = len(test_raw)
+
+if SMOKE:
+    log("SMOKE MODE: subsample to 30000 rows, 1 fold")
+    rng_sm = np.random.default_rng(0)
+    keep_sm = rng_sm.choice(n_train, 30000, replace=False)
+    folds_list = [folds_list[0]]
+
+# ─── Stateless FE (computed once, safe) ───────────────────────────────────────
+log("Applying stateless FE ...")
+X_raw = train_raw.drop(columns=[IDC, TARGET])
+X_test_raw = test_raw.drop(columns=[IDC])
+
+X_stateless = stateless_fe(X_raw)
+X_test_stateless = stateless_fe(X_test_raw)
+log(f"  X_stateless={X_stateless.shape}  X_test_stateless={X_test_stateless.shape}")
+
+def prepare_fold_arrays(fi, n_train, y_all, X_stateless, X_test_stateless, SEED, SMOKE=False, keep_sm=None):
+    """Shared fold prep: FE, encoding, standardization. Returns arrays + metadata."""
+    fold_id = fi["fold"]
+    val_idx = np.asarray(fi["val_idx"])
+    tr_idx = np.setdiff1d(np.arange(n_train), val_idx)
+    fold_seed = SEED + (fold_id + 1) * 100
+    seed_everything(fold_seed)
+
+    if SMOKE and keep_sm is not None:
+        keep_set = set(keep_sm.tolist())
+        tr_idx = np.array([i for i in tr_idx if i in keep_set])
+        val_idx = np.array([i for i in val_idx if i in keep_set])
+
+    log(f"Fold {fold_id}: train={len(tr_idx)} val={len(val_idx)}")
+
+    X_tr_fold, X_val_fold, X_te_fold, cat_cols, combo_names, local_map = fit_fold_categoricals(
+        X_stateless.iloc[tr_idx].reset_index(drop=True),
+        X_stateless.iloc[val_idx].reset_index(drop=True),
+        X_test_stateless.copy(),
+    )
+
+    y_tr_fold = y_all[tr_idx]
+    y_val_fold = y_all[val_idx]
+    X_tr_fold, X_val_fold, X_te_fold, te_names = add_target_encoding(
+        X_tr_fold, y_tr_fold, X_val_fold, X_te_fold, combo_names, fold_seed
+    )
+
+    X_tr_fold = X_tr_fold.reindex(sorted(X_tr_fold.columns), axis=1)
+    X_val_fold = X_val_fold.reindex(sorted(X_val_fold.columns), axis=1)
+    X_te_fold = X_te_fold.reindex(sorted(X_te_fold.columns), axis=1)
+
+    cat_cols_sorted = sorted(cat_cols)
+    TABM_CAT_COLS = [c for c in cat_cols_sorted if c in BASE_CAT_COLS]
+    all_cols_sorted = sorted(X_tr_fold.columns)
+    num_for_tabm = [c for c in all_cols_sorted if c not in TABM_CAT_COLS]
+
+    Xn_tr = X_tr_fold[num_for_tabm].values.astype(np.float32)
+    Xn_va = X_val_fold[num_for_tabm].values.astype(np.float32)
+    Xn_te = X_te_fold[num_for_tabm].values.astype(np.float32)
+
+    if TABM_CAT_COLS:
+        Xc_tr = X_tr_fold[TABM_CAT_COLS].values.astype(np.int64)
+        Xc_va = X_val_fold[TABM_CAT_COLS].values.astype(np.int64)
+        Xc_te = X_te_fold[TABM_CAT_COLS].values.astype(np.int64)
+        cat_cards = (Xc_tr.max(axis=0) + 2).tolist()
+        card_arr = np.array(cat_cards) - 1
+        Xc_tr = np.clip(Xc_tr, 0, card_arr)
+        Xc_va = np.clip(Xc_va, 0, card_arr)
+        Xc_te = np.clip(Xc_te, 0, card_arr)
+    else:
+        Xc_tr = Xc_va = Xc_te = None
+        cat_cards = []
+
+    mu = Xn_tr.mean(0)
+    sd = Xn_tr.std(0) + 1e-8
+    Xn_tr = (Xn_tr - mu) / sd
+    Xn_va = (Xn_va - mu) / sd
+    Xn_te = (Xn_te - mu) / sd
+
+    return dict(
+        fold_id=fold_id, val_idx=val_idx, tr_idx=tr_idx, fold_seed=fold_seed,
+        y_tr_fold=y_tr_fold, y_val_fold=y_val_fold,
+        Xn_tr=Xn_tr, Xn_va=Xn_va, Xn_te=Xn_te,
+        Xc_tr=Xc_tr, Xc_va=Xc_va, Xc_te=Xc_te,
+        cat_cards=cat_cards, cat_cols_sorted=cat_cols_sorted, num_for_tabm=num_for_tabm,
+        n_features=X_tr_fold.shape[1], n_tabm_cat=len(TABM_CAT_COLS),
+    )
+
+
+# ─── OOF loop ─────────────────────────────────────────────────────────────────
+oof_proba = np.zeros((n_train, N_CLASSES), dtype=np.float32)
+test_proba_accum = np.zeros((n_test, N_CLASSES), dtype=np.float32)
+per_fold_scores = []
+cat_cols_final = None
+num_cols_final = None
+
+log("Starting OOF loop ...")
+fold_t0 = time.perf_counter()
+
+# ─── FOLD-0 SWEEP: pick best STAR_MULT ────────────────────────────────────────
+# Load node_0070 bank for err-corr gate
+BANK_PATH = COMP_DIR / "nodes/node_0070/oof.npy"
+bank_oof = np.load(BANK_PATH)   # (577347, 3)
+log(f"Loaded bank OOF from {BANK_PATH}  shape={bank_oof.shape}")
+
+if STAR_MULT_FIXED is not None:
+    BEST_STAR_MULT = STAR_MULT_FIXED
+    log(f"STAR_MULT fixed to {BEST_STAR_MULT} (from env)")
+else:
+    log("--- FOLD-0 SWEEP: STAR_MULT ∈ {1.5, 2.0} ---")
+    fi0 = [f for f in folds_list if f["fold"] == 0][0]
+    fold0_data = prepare_fold_arrays(fi0, n_train, y_all, X_stateless, X_test_stateless, SEED)
+    log(f"  n_features={fold0_data['n_features']}  tabm_cat={fold0_data['n_tabm_cat']}  tabm_num={len(fold0_data['num_for_tabm'])}")
+
+    sweep_results = {}
+    for sm in STAR_MULT_CANDIDATES:
+        log(f"  Sweep STAR_MULT={sm}")
+        seed_everything(fold0_data["fold_seed"])
+        m, bins_ = train_tabm(
+            fold0_data["Xn_tr"], fold0_data["Xc_tr"], fold0_data["y_tr_fold"],
+            fold0_data["cat_cards"], fold0_data["fold_seed"], star_mult=sm,
+        )
+        vp = predict_proba_batch(m, fold0_data["Xn_va"], fold0_data["Xc_va"])
+        ba = balanced_accuracy_score(fold0_data["y_val_fold"], vp.argmax(1))
+
+        # err-corr vs bank (node_0070 fold-0 val)
+        val_idx0 = fold0_data["val_idx"]
+        bank_vp = bank_oof[val_idx0]
+        # per-class error indicator (1 if wrong)
+        err_mine = (vp.argmax(1) != fold0_data["y_val_fold"]).astype(float)
+        err_bank = (bank_vp.argmax(1) != fold0_data["y_val_fold"]).astype(float)
+        if err_mine.std() > 1e-9 and err_bank.std() > 1e-9:
+            errcorr = float(np.corrcoef(err_mine, err_bank)[0, 1])
+        else:
+            errcorr = 1.0
+        sweep_results[sm] = {"ba": ba, "errcorr": errcorr}
+        log(f"    STAR_MULT={sm}: fold0_BA={ba:.6f}  err_corr={errcorr:.4f}")
+        print(f"sweep_star_mult={sm} fold0_BA={ba:.6f} err_corr={errcorr:.4f}", flush=True)
+
+        del m
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # pick best by BA; then check gates
+    BEST_STAR_MULT = max(sweep_results, key=lambda sm: sweep_results[sm]["ba"])
+    best_res = sweep_results[BEST_STAR_MULT]
+    log(f"Best STAR_MULT={BEST_STAR_MULT}  fold0_BA={best_res['ba']:.6f}  err_corr={best_res['errcorr']:.4f}")
+    print(f"best_star_mult={BEST_STAR_MULT} fold0_BA={best_res['ba']:.6f} err_corr={best_res['errcorr']:.4f}", flush=True)
+
+    # Gate 1: fold-0 BA >= 0.965
+    if best_res["ba"] < 0.965:
+        log(f"GATE TRIPPED: fold-0 BA={best_res['ba']:.6f} < 0.965 — STOP")
+        print(f"GATE_TRIPPED=BA gate: fold0_BA={best_res['ba']:.6f} < 0.965", flush=True)
+        sys.exit(1)
+
+    # Gate 2: err-corr < 0.70
+    if best_res["errcorr"] >= 0.70:
+        log(f"GATE TRIPPED: err_corr={best_res['errcorr']:.4f} >= 0.70 — STOP (same arch, decorr fails)")
+        print(f"GATE_TRIPPED=ERRCORR: err_corr={best_res['errcorr']:.4f} >= 0.70", flush=True)
+        sys.exit(1)
+
+    log(f"Both gates pass. Running full 5-fold at STAR_MULT={BEST_STAR_MULT}")
+
+log(f"Using STAR_MULT={BEST_STAR_MULT} for full OOF run")
+
+for fi in folds_list:
+    fold_id = fi["fold"]
+    fold_data = prepare_fold_arrays(fi, n_train, y_all, X_stateless, X_test_stateless, SEED,
+                                    SMOKE=SMOKE, keep_sm=(keep_sm if SMOKE else None))
+
+    if cat_cols_final is None:
+        cat_cols_final = fold_data["cat_cols_sorted"]
+        num_cols_final = fold_data["num_for_tabm"]
+        log(f"  n_features={fold_data['n_features']}  tabm_cat={fold_data['n_tabm_cat']}  tabm_num={len(fold_data['num_for_tabm'])}")
+
+    val_idx = fold_data["val_idx"]
+    y_val_fold = fold_data["y_val_fold"]
+
+    model, bins = train_tabm(
+        fold_data["Xn_tr"], fold_data["Xc_tr"], fold_data["y_tr_fold"],
+        fold_data["cat_cards"], fold_data["fold_seed"], star_mult=BEST_STAR_MULT,
+    )
+
+    val_probs = predict_proba_batch(model, fold_data["Xn_va"], fold_data["Xc_va"])
+    oof_proba[val_idx] = val_probs.astype(np.float32)
+
+    test_probs_fold = predict_proba_batch(model, fold_data["Xn_te"], fold_data["Xc_te"])
+    test_proba_accum += test_probs_fold.astype(np.float32) / len(folds_list)
+
+    fold_score = balanced_accuracy_score(y_val_fold, np.argmax(oof_proba[val_idx], axis=1))
+    per_fold_scores.append(fold_score)
+    fold_elapsed = time.perf_counter() - fold_t0
+    log(f"  fold {fold_id}: balanced_accuracy={fold_score:.6f}  elapsed={fold_elapsed:.1f}s")
+    print(f"fold{fold_id}_score={fold_score:.6f}", flush=True)
+
+    if torch.cuda.is_available():
+        vram_gb = torch.cuda.max_memory_allocated() / 1e9
+        log(f"  peak VRAM so far: {vram_gb:.2f} GB")
+
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    if fold_id == 0:
+        fold_time = time.perf_counter() - fold_t0
+        projected = fold_time * len(folds_list)
+        log(f"  TIMING: fold0={fold_time:.1f}s  projected_5fold={projected:.1f}s  "
+            f"({projected/60:.1f}min)")
+
+if SMOKE:
+    log("[smoke] OK — pipeline ran. Exiting before saving artifacts.")
+    sys.exit(0)
+
+mean_cv = float(np.mean(per_fold_scores))
+sem_cv = float(np.std(per_fold_scores, ddof=1) / np.sqrt(len(per_fold_scores)))
+log("per_fold=" + ",".join(f"{s:.6f}" for s in per_fold_scores))
+log(f"cv={mean_cv:.6f}+/-{sem_cv:.6f}")
+print(f"cv={mean_cv:.6f}", flush=True)
+
+# ─── Save OOF ─────────────────────────────────────────────────────────────────
+np.save(NODE_DIR / "oof.npy", oof_proba)
+log(f"Saved oof.npy shape={oof_proba.shape}")
+
+# ─── Save test_probs ──────────────────────────────────────────────────────────
+np.save(NODE_DIR / "test_probs.npy", test_proba_accum)
+log(f"Saved test_probs.npy shape={test_proba_accum.shape}")
+
+# ─── Write submission ─────────────────────────────────────────────────────────
+pred_labels = np.array([CLASSES[i] for i in test_proba_accum.argmax(1)])
+sub = pd.DataFrame({IDC: test_raw[IDC].values, TARGET: pred_labels})
+sub = sub[list(sample_sub.columns)]
+sub.to_csv(NODE_DIR / "submission.csv", index=False)
+log(f"Saved submission.csv ({len(sub)} rows)")
+log(f"Submission class distribution:\n{sub[TARGET].value_counts().to_string()}")
+
+# ─── Write features.txt ───────────────────────────────────────────────────────
+# num_cols_final = all columns treated as numerical by TabM (includes int-floor cat codes)
+# cat_cols_final = all cat-typed columns from FE (for reference; only spectral/galaxy go to TabM as cats)
+# features.txt = all columns fed to the model (num_cols_final union TABM_CAT_COLS)
+tabm_cat_in_file = [c for c in (cat_cols_final or []) if c in BASE_CAT_COLS]
+all_features = sorted((num_cols_final or []) + tabm_cat_in_file)
+(NODE_SRC / "features.txt").write_text("\n".join(all_features) + "\n")
+log(f"Wrote features.txt ({len(all_features)} features)")
+
+# ─── Final OOF metric ─────────────────────────────────────────────────────────
+oof_metric = balanced_accuracy_score(y_all, oof_proba.argmax(1))
+log(f"OOF full balanced_accuracy={oof_metric:.6f}")
+
+total_elapsed = time.perf_counter() - T0
+log(f"Total elapsed: {total_elapsed:.1f}s ({total_elapsed/60:.1f}min)")
+log("Done.")

@@ -1,0 +1,143 @@
+target:
+- class
+continuous_cols:
+- _alpha_cat___delta_cat___TE_class0
+- _alpha_cat___delta_cat___TE_class1
+- _alpha_cat___delta_cat___TE_class2
+- _g-i
+- _g-r
+- _g_div_redshift
+- _i-z
+- _i_div_redshift
+- _log1p_redshift
+- _mag_mean
+- _mag_range
+- _r-i
+- _r-z
+- _u-g
+- _u-r
+- _u_cat___z_cat___TE_class0
+- _u_cat___z_cat___TE_class1
+- _u_cat___z_cat___TE_class2
+- alpha
+- alpha_cat_
+- alpha_cat___delta_cat___
+- delta
+- delta_100_quantile_bin_
+- delta_500_quantile_bin_
+- delta_cat_
+- g
+- g_cat_
+- galaxy_population
+- i
+- i_cat_
+- r
+- r_cat_
+- redshift
+- redshift_cat_
+- spectral_type
+- u
+- u_cat_
+- u_cat___z_cat___
+- z
+- z_cat_
+categorical_cols: []
+date_columns: []
+encode_date_columns: true
+validation_split: 0.2
+continuous_feature_transform: null
+normalize_continuous_features: false
+quantile_noise: 0
+num_workers: 0
+pin_memory: true
+handle_unknown_categories: true
+handle_missing_values: true
+pickle_protocol: 2
+dataloader_kwargs: {}
+task: classification
+head: LinearHead
+head_config:
+  layers: ''
+embedding_dims: []
+embedding_dropout: 0.0
+batch_norm_continuous_input: true
+learning_rate: 0.001
+loss: CrossEntropyLoss
+metrics:
+- accuracy
+metrics_prob_input:
+- false
+metrics_params:
+- sub_params_list:
+  - task: multiclass
+    num_classes: 3
+    top_k: 1
+target_range: null
+virtual_batch_size: null
+seed: 142
+_module_src: models.node
+_model_name: NODEModel
+_backbone_name: NODEBackbone
+_config_name: NodeConfig
+num_layers: 2
+num_trees: 512
+additional_tree_output_dim: 3
+depth: 6
+choice_function: entmax15
+bin_function: entmoid15
+max_features: null
+input_dropout: 0.0
+initialize_response: normal
+initialize_selection_logits: uniform
+threshold_init_beta: 1.0
+threshold_init_cutoff: 1.0
+batch_size: 1024
+data_aware_init_batch_size: 256
+fast_dev_run: false
+max_epochs: 30
+min_epochs: 1
+max_time: null
+accelerator: gpu
+devices: 1
+devices_list: null
+accumulate_grad_batches: 1
+auto_lr_find: false
+auto_select_gpus: true
+check_val_every_n_epoch: 1
+gradient_clip_val: 0.0
+overfit_batches: 0.0
+deterministic: false
+profiler: null
+early_stopping: valid_loss
+early_stopping_min_delta: 0.001
+early_stopping_mode: min
+early_stopping_patience: 5
+early_stopping_kwargs: {}
+checkpoints: valid_loss
+checkpoints_path: /home/vaibhav/projects/personal/grandmaster/comps/playground-series-s6e6/nodes/node_0082/_ckpt_fold0
+checkpoints_every_n_epochs: 1
+checkpoints_name: null
+checkpoints_mode: min
+checkpoints_save_top_k: 1
+checkpoints_kwargs: {}
+load_best: true
+track_grad_norm: -1
+progress_bar: none
+precision: '32'
+trainer_kwargs: {}
+optimizer: AdamW
+optimizer_params:
+  weight_decay: 0.0001
+lr_scheduler: CosineAnnealingLR
+lr_scheduler_params:
+  T_max: 30
+  eta_min: 1.0e-05
+lr_scheduler_monitor_metric: valid_loss
+lr_scheduler_interval: epoch
+categorical_dim: 0
+continuous_dim: 40
+output_dim: 3
+output_cardinality:
+- 3
+categorical_cardinality: []
+embedded_cat_dim: 0
