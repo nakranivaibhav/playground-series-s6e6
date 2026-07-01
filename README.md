@@ -13,6 +13,14 @@ baselines, and a long propose → build → gate → decide experiment loop — 
 The full playbook is in [`CLAUDE.md`](CLAUDE.md); every experiment is recorded under
 [`comps/playground-series-s6e6/`](comps/playground-series-s6e6/).
 
+> **It works best with a human actively steering, not walked away from.** The agent
+> can grind autonomously between gates, but it shines when a human is in the loop:
+> **calling dead ends** ("this lever's exhausted, drop it"), **reviewing and approving/
+> rejecting the proposals** each round, and **feeding new directions** (a paper to try,
+> a public notebook to diff against, a modality to add). Left fully on autopilot it will
+> keep proposing and building competently — but the biggest jumps here came from a human
+> pruning the search and pointing it somewhere new.
+
 ## The journey (144 experiments → the champion)
 
 ```mermaid
