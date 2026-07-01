@@ -7,7 +7,7 @@ photometric + spectral measurements. Metric: **balanced accuracy** (higher is be
 > logistic-regression **stack** over 63 diverse base models
 > (public LB **0.97121**, cross-validation **0.970355**).
 
-This repo is an **autonomous-but-supervised Kaggle agent** ("kaggleforge"): a human pastes a
+This repo is an **autonomous-but-supervised Kaggle agent** ("grandmaster"): a human pastes a
 competition link and Claude Code drives the whole pipeline — data understanding, validation,
 baselines, and a long propose → build → gate → decide experiment loop — pausing at human gates.
 The full playbook is in [`CLAUDE.md`](CLAUDE.md); every experiment is recorded under
